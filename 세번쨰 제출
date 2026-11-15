@@ -1,0 +1,1083 @@
+```c
+
+#include "raylib.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+
+#define BW 10
+#define BH 20
+#define CELL 30
+#define OX 225
+#define OY 65
+#define LOCK_TIME 0.5f
+#define MAX_RESETS 15
+#define MAX_PARTICLES 260
+
+typedef struct {
+    int type, rot, x, y;
+} Piece;
+
+typedef struct {
+    float x, y, vx, vy;
+    float life, maxLife;
+    Color color;
+} Particle;
+
+static int board[BH][BW];
+static Piece cur;
+
+static int bag[7], bagIndex;
+static int queue[5], held, holdUsed;
+static int score, lines, level, gameOver, paused, combo;
+
+static float fallTimer, lockTimer, moveTimer, downTimer;
+static int lockResets, lastRotate, lastKick;
+
+static char eventText[80];
+static float eventTimer;
+
+static Particle particles[MAX_PARTICLES];
+static int particleCursor;
+static float flashTimer, shakeTimer;
+static int flashRows[BH];
+static int lastAward;
+static float awardTimer;
+
+// I O T S Z J L
+static const char* shapes[7][4] = {
+    {
+        "....XXXX........",
+        "..X...X...X...X.",
+        "........XXXX....",
+        ".X...X...X...X.."
+    },
+    {
+        ".XX..XX.........",
+        ".XX..XX.........",
+        ".XX..XX.........",
+        ".XX..XX........."
+    },
+    {
+        ".X..XXX.........",
+        ".X...XX..X......",
+        "....XXX..X......",
+        ".X..XX...X......"
+    },
+    {
+        ".XX.XX..........",
+        ".X...XX...X.....",
+        ".....XX.XX......",
+        "X...XX...X......"
+    },
+    {
+        "XX...XX.........",
+        "..X..XX..X......",
+        "....XX...XX.....",
+        ".X..XX..X......."
+    },
+    {
+        "X...XXX.........",
+        ".XX..X...X......",
+        "....XXX...X.....",
+        ".X...X..XX......"
+    },
+    {
+        "..X.XXX.........",
+        ".X...X...XX.....",
+        "....XXX.X.......",
+        "XX...X...X......"
+    }
+};
+
+static const Color colors[8] = {
+    {23, 28, 43, 255},
+    {55, 220, 240, 255},
+    {244, 209, 70, 255},
+    {179, 103, 244, 255},
+    {90, 220, 137, 255},
+    {240, 91, 112, 255},
+    {91, 132, 245, 255},
+    {255, 159, 78, 255}
+};
+
+// ==============================
+// Particle effects
+// ==============================
+
+static float randUnit(void) {
+    return (float)GetRandomValue(0, 10000) / 10000.0f;
+}
+
+static void burstRow(int row, int strength) {
+    for (int x = 0; x < BW; x++) {
+        Color c = colors[board[row][x] ? board[row][x] : 1];
+
+        for (int j = 0; j < strength; j++) {
+            Particle* p =
+                &particles[particleCursor++ % MAX_PARTICLES];
+
+            p->x = OX + x * CELL + CELL * randUnit();
+            p->y = OY + row * CELL + CELL * randUnit();
+
+            p->vx = (randUnit() - 0.5f) * 430.0f;
+            p->vy = -80.0f - randUnit() * 320.0f;
+
+            p->life = p->maxLife =
+                0.4f + randUnit() * 0.55f;
+
+            p->color = c;
+        }
+    }
+}
+
+static void updateEffects(float dt) {
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        if (particles[i].life > 0) {
+            Particle* p = &particles[i];
+
+            p->life -= dt;
+            p->x += p->vx * dt;
+            p->y += p->vy * dt;
+
+            p->vy += 550 * dt;
+            p->vx *= 1.0f - 0.8f * dt;
+        }
+    }
+
+    if (flashTimer > 0) flashTimer -= dt;
+    if (shakeTimer > 0) shakeTimer -= dt;
+    if (awardTimer > 0) awardTimer -= dt;
+}
+
+// ==============================
+// Board and pieces
+// ==============================
+
+static int occupied(int t, int r, int x, int y) {
+    return shapes[t][r][y * 4 + x] == 'X';
+}
+
+static int fits(Piece p) {
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            if (occupied(p.type, p.rot, x, y)) {
+                int bx = p.x + x;
+                int by = p.y + y;
+
+                if (bx < 0 || bx >= BW || by >= BH)
+                    return 0;
+
+                if (by >= 0 && board[by][bx])
+                    return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static void refillBag(void) {
+    for (int i = 0; i < 7; i++)
+        bag[i] = i;
+
+    for (int i = 6; i > 0; i--) {
+        int j = GetRandomValue(0, i);
+        int t = bag[i];
+
+        bag[i] = bag[j];
+        bag[j] = t;
+    }
+
+    bagIndex = 0;
+}
+
+static int nextFromBag(void) {
+    if (bagIndex >= 7)
+        refillBag();
+
+    return bag[bagIndex++];
+}
+
+static void announce(const char* s) {
+    snprintf(eventText, sizeof(eventText), "%s", s);
+    eventTimer = 1.7f;
+}
+
+static void spawn(int type) {
+    cur = (Piece){ type, 0, 3, -1 };
+
+    fallTimer = 0;
+    lockTimer = 0;
+    lockResets = 0;
+    lastRotate = 0;
+    lastKick = 0;
+
+    if (!fits(cur))
+        gameOver = 1;
+}
+
+static void takeNext(void) {
+    int t = queue[0];
+
+    for (int i = 0; i < 4; i++)
+        queue[i] = queue[i + 1];
+
+    queue[4] = nextFromBag();
+
+    spawn(t);
+    holdUsed = 0;
+}
+
+static void resetGame(void) {
+    memset(board, 0, sizeof(board));
+
+    bagIndex = 7;
+    refillBag();
+
+    for (int i = 0; i < 5; i++)
+        queue[i] = nextFromBag();
+
+    held = -1;
+    holdUsed = 0;
+
+    score = 0;
+    lines = 0;
+    gameOver = 0;
+    paused = 0;
+
+    level = 1;
+    combo = -1;
+
+    moveTimer = 0;
+    downTimer = 0;
+    eventTimer = 0;
+    eventText[0] = 0;
+
+    memset(particles, 0, sizeof(particles));
+    memset(flashRows, 0, sizeof(flashRows));
+
+    particleCursor = 0;
+    flashTimer = 0;
+    shakeTimer = 0;
+    awardTimer = 0;
+    lastAward = 0;
+
+    takeNext();
+}
+
+static int grounded(void) {
+    Piece p = cur;
+    p.y++;
+    return !fits(p);
+}
+
+static void resetLockOnAction(int wasGrounded) {
+    if (wasGrounded && lockResets < MAX_RESETS) {
+        lockTimer = 0;
+        lockResets++;
+    }
+}
+
+static int movePiece(int dx, int dy, int manual) {
+    Piece p = cur;
+
+    p.x += dx;
+    p.y += dy;
+
+    if (!fits(p))
+        return 0;
+
+    int wasGrounded = grounded();
+    cur = p;
+
+    if (manual) {
+        lastRotate = 0;
+        resetLockOnAction(wasGrounded);
+    }
+
+    return 1;
+}
+
+// ==============================
+// SRS rotation
+// ==============================
+
+static const int jlKick[4][2][5][2] = {
+    {
+        {{0,0},{-1,0},{-1,-1},{0,2},{-1,2}},
+        {{0,0},{1,0},{1,-1},{0,2},{1,2}}
+    },
+    {
+        {{0,0},{1,0},{1,1},{0,-2},{1,-2}},
+        {{0,0},{1,0},{1,1},{0,-2},{1,-2}}
+    },
+    {
+        {{0,0},{1,0},{1,-1},{0,2},{1,2}},
+        {{0,0},{-1,0},{-1,-1},{0,2},{-1,2}}
+    },
+    {
+        {{0,0},{-1,0},{-1,1},{0,-2},{-1,-2}},
+        {{0,0},{-1,0},{-1,1},{0,-2},{-1,-2}}
+    }
+};
+
+static const int iKick[4][2][5][2] = {
+    {
+        {{0,0},{-2,0},{1,0},{-2,1},{1,-2}},
+        {{0,0},{-1,0},{2,0},{-1,-2},{2,1}}
+    },
+    {
+        {{0,0},{-1,0},{2,0},{-1,-2},{2,1}},
+        {{0,0},{2,0},{-1,0},{2,-1},{-1,2}}
+    },
+    {
+        {{0,0},{2,0},{-1,0},{2,-1},{-1,2}},
+        {{0,0},{1,0},{-2,0},{1,2},{-2,-1}}
+    },
+    {
+        {{0,0},{1,0},{-2,0},{1,2},{-2,-1}},
+        {{0,0},{-2,0},{1,0},{-2,1},{1,-2}}
+    }
+};
+
+static void rotatePiece(int dir) {
+    int nr = (cur.rot + dir + 4) % 4;
+    int idx = (dir == 1) ? 0 : 1;
+    int wasGrounded = grounded();
+
+    for (int k = 0; k < 5; k++) {
+        Piece p = cur;
+        p.rot = nr;
+
+        if (cur.type != 1) {
+            const int (*kick)[2] =
+                (cur.type == 0)
+                ? iKick[cur.rot][idx]
+                : jlKick[cur.rot][idx];
+
+            p.x += kick[k][0];
+            p.y += kick[k][1];
+        }
+        else if (k > 0) {
+            break;
+        }
+
+        if (fits(p)) {
+            cur = p;
+            lastRotate = 1;
+            lastKick = k;
+
+            resetLockOnAction(wasGrounded);
+            return;
+        }
+    }
+}
+
+// ==============================
+// T-spin detection
+// ==============================
+
+static int solidCorner(int x, int y) {
+    if (x < 0 || x >= BW || y >= BH)
+        return 1;
+
+    if (y < 0)
+        return 0;
+
+    return board[y][x] != 0;
+}
+
+static int tspinType(void) {
+    if (cur.type != 2 || !lastRotate)
+        return 0;
+
+    int cx = cur.x + 1;
+    int cy = cur.y + 1;
+
+    int corners =
+        solidCorner(cx - 1, cy - 1) +
+        solidCorner(cx + 1, cy - 1) +
+        solidCorner(cx - 1, cy + 1) +
+        solidCorner(cx + 1, cy + 1);
+
+    if (corners < 3)
+        return 0;
+
+    int front = 0;
+
+    switch (cur.rot) {
+    case 0:
+        front = solidCorner(cx - 1, cy - 1)
+            + solidCorner(cx + 1, cy - 1);
+        break;
+
+    case 1:
+        front = solidCorner(cx + 1, cy - 1)
+            + solidCorner(cx + 1, cy + 1);
+        break;
+
+    case 2:
+        front = solidCorner(cx - 1, cy + 1)
+            + solidCorner(cx + 1, cy + 1);
+        break;
+
+    default:
+        front = solidCorner(cx - 1, cy - 1)
+            + solidCorner(cx - 1, cy + 1);
+        break;
+    }
+
+    return (front == 2 || lastKick == 4) ? 2 : 1;
+}
+
+// ==============================
+// Lock and line clear
+// ==============================
+
+static void lockPiece(void) {
+    int spin = tspinType();
+
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            if (occupied(cur.type, cur.rot, x, y)) {
+                int by = cur.y + y;
+                int bx = cur.x + x;
+
+                if (by < 0) {
+                    gameOver = 1;
+                    return;
+                }
+
+                board[by][bx] = cur.type + 1;
+            }
+        }
+    }
+
+    int cleared = 0;
+    memset(flashRows, 0, sizeof(flashRows));
+
+    for (int y = BH - 1; y >= 0;) {
+        int full = 1;
+
+        for (int x = 0; x < BW; x++) {
+            if (!board[y][x]) {
+                full = 0;
+                break;
+            }
+        }
+
+        if (full) {
+            flashRows[y] = 1;
+
+            burstRow(y, spin ? 7 : 5);
+            cleared++;
+
+            for (int j = y; j > 0; j--) {
+                memcpy(
+                    board[j],
+                    board[j - 1],
+                    sizeof(board[j])
+                );
+            }
+
+            memset(board[0], 0, sizeof(board[0]));
+        }
+        else {
+            y--;
+        }
+    }
+
+    static const int normalPts[5] =
+    { 0, 100, 300, 500, 800 };
+
+    static const int fullPts[4] =
+    { 400, 800, 1200, 1600 };
+
+    static const int miniPts[3] =
+    { 100, 200, 400 };
+
+    int base = normalPts[cleared];
+
+    if (spin == 2)
+        base = fullPts[cleared > 3 ? 3 : cleared];
+
+    if (spin == 1)
+        base = miniPts[cleared > 2 ? 2 : cleared];
+
+    int previousScore = score;
+    score += base * level;
+
+    if (cleared) {
+        combo++;
+        score += combo * 50 * level;
+
+        lines += cleared;
+        level = 1 + lines / 10;
+
+        if (spin)
+            announce(spin == 2 ? "T-SPIN!" : "T-SPIN MINI!");
+        else if (cleared == 4)
+            announce("TETRIS!");
+        else if (cleared == 3)
+            announce("TRIPLE!");
+        else if (cleared == 2)
+            announce("DOUBLE!");
+        else
+            announce("SINGLE!");
+    }
+    else {
+        combo = -1;
+
+        if (spin)
+            announce(spin == 2 ? "T-SPIN!" : "T-SPIN MINI!");
+    }
+
+    if (cleared) {
+        flashTimer = 0.24f;
+
+        shakeTimer = cleared >= 2 ? 0.23f : 0.10f;
+
+        if (spin || cleared == 4)
+            shakeTimer = 0.40f;
+    }
+
+    lastAward = score - previousScore;
+    awardTimer = lastAward > 0 ? 1.1f : 0;
+
+    takeNext();
+}
+
+static void hardDrop(void) {
+    int distance = 0;
+
+    while (movePiece(0, 1, 0))
+        distance++;
+
+    score += distance * 2;
+    lockPiece();
+}
+
+static void holdPiece(void) {
+    if (holdUsed)
+        return;
+
+    int old = cur.type;
+
+    if (held < 0) {
+        held = old;
+        takeNext();
+    }
+    else {
+        int t = held;
+        held = old;
+        spawn(t);
+    }
+
+    holdUsed = 1;
+}
+
+// ==============================
+// Rendering
+// ==============================
+
+static void drawCell(int x, int y, int t, int alpha) {
+    Color c = colors[t];
+    c.a = (unsigned char)alpha;
+
+    Rectangle rect = {
+        (float)x + 1,
+        (float)y + 1,
+        CELL - 2,
+        CELL - 2
+    };
+
+    DrawRectangleRounded(rect, 0.15f, 3, c);
+
+    if (alpha == 255) {
+        DrawRectangle(
+            x + 5, y + 4, CELL - 10, 3,
+            Fade(WHITE, 0.25f)
+        );
+
+        DrawRectangleLinesEx(
+            (Rectangle) {
+            (float)x + 1,
+                (float)y + 1,
+                CELL - 2,
+                CELL - 2
+        },
+            1,
+            Fade(BLACK, 0.25f)
+        );
+    }
+}
+
+// Center a preview piece inside its panel.
+static void drawMini(
+    int type,
+    int px,
+    int py,
+    int width,
+    int height,
+    int cell
+) {
+    if (type < 0)
+        return;
+
+    int minX = 4, minY = 4;
+    int maxX = -1, maxY = -1;
+
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            if (occupied(type, 0, x, y)) {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+
+    int sx = px +
+        (width - (maxX - minX + 1) * cell) / 2;
+
+    int sy = py +
+        (height - (maxY - minY + 1) * cell) / 2;
+
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            if (occupied(type, 0, x, y)) {
+                int bx = sx + (x - minX) * cell;
+                int by = sy + (y - minY) * cell;
+
+                DrawRectangleRounded(
+                    (Rectangle) {
+                    (float)bx,
+                        (float)by,
+                        (float)cell - 2,
+                        (float)cell - 2
+                },
+                    0.15f,
+                    2,
+                    colors[type + 1]
+                );
+            }
+        }
+    }
+}
+
+static void drawGame(void) {
+    ClearBackground((Color) { 12, 16, 28, 255 });
+
+    DrawText(
+        "TETRIS  /  RAYLIB",
+        OX, 18, 25, RAYWHITE
+    );
+
+    int shakeX = 0;
+    int shakeY = 0;
+
+    if (shakeTimer > 0) {
+        shakeX = GetRandomValue(-5, 5);
+        shakeY = GetRandomValue(-4, 4);
+    }
+
+    BeginScissorMode(
+        OX - 8, OY - 8,
+        BW * CELL + 16,
+        BH * CELL + 16
+    );
+
+    Camera2D camera = { 0 };
+    camera.offset = (Vector2){
+        (float)shakeX,
+        (float)shakeY
+    };
+    camera.zoom = 1.0f;
+
+    BeginMode2D(camera);
+
+    DrawRectangle(
+        OX - 3, OY - 3,
+        BW * CELL + 6,
+        BH * CELL + 6,
+        (Color) {
+        75, 90, 125, 255
+    }
+    );
+
+    DrawRectangle(
+        OX, OY,
+        BW * CELL,
+        BH * CELL,
+        colors[0]
+    );
+
+    // Board
+    for (int y = 0; y < BH; y++) {
+        for (int x = 0; x < BW; x++) {
+            DrawRectangleLines(
+                OX + x * CELL,
+                OY + y * CELL,
+                CELL,
+                CELL,
+                (Color) {
+                35, 42, 60, 255
+            }
+            );
+
+            if (board[y][x]) {
+                drawCell(
+                    OX + x * CELL,
+                    OY + y * CELL,
+                    board[y][x],
+                    255
+                );
+            }
+        }
+    }
+
+    if (!gameOver) {
+        Piece ghost = cur;
+
+        while (1) {
+            Piece p = ghost;
+            p.y++;
+
+            if (!fits(p))
+                break;
+
+            ghost = p;
+        }
+
+        // Ghost piece
+        for (int y = 0; y < 4; y++) {
+            for (int x = 0; x < 4; x++) {
+                if (occupied(cur.type, cur.rot, x, y)) {
+                    int gx = ghost.x + x;
+                    int gy = ghost.y + y;
+
+                    if (gy >= 0) {
+                        DrawRectangleLinesEx(
+                            (Rectangle) {
+                            (float)(OX + gx * CELL + 3),
+                                (float)(OY + gy * CELL + 3),
+                                CELL - 6,
+                                CELL - 6
+                        },
+                            2,
+                            Fade(colors[cur.type + 1], 0.65f)
+                        );
+                    }
+                }
+            }
+        }
+
+        // Current piece
+        for (int y = 0; y < 4; y++) {
+            for (int x = 0; x < 4; x++) {
+                if (occupied(cur.type, cur.rot, x, y)) {
+                    int bx = cur.x + x;
+                    int by = cur.y + y;
+
+                    if (by >= 0) {
+                        drawCell(
+                            OX + bx * CELL,
+                            OY + by * CELL,
+                            cur.type + 1,
+                            255
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Line-clear flash
+    if (flashTimer > 0) {
+        float alpha = flashTimer / 0.24f;
+
+        for (int y = 0; y < BH; y++) {
+            if (flashRows[y]) {
+                DrawRectangle(
+                    OX,
+                    OY + y * CELL,
+                    BW * CELL,
+                    CELL,
+                    Fade(WHITE, alpha * 0.85f)
+                );
+            }
+        }
+    }
+
+    // Particles
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        if (particles[i].life > 0) {
+            Particle* p = &particles[i];
+
+            DrawRectangle(
+                (int)p->x,
+                (int)p->y,
+                5, 5,
+                Fade(
+                    p->color,
+                    p->life / p->maxLife
+                )
+            );
+        }
+    }
+
+    EndMode2D();
+    EndScissorMode();
+
+    // Hold panel
+    DrawText("HOLD", 55, 80, 23, RAYWHITE);
+
+    DrawRectangle(
+        38, 112, 160, 130,
+        (Color) {
+        29, 36, 54, 255
+    }
+    );
+
+    drawMini(held, 38, 112, 160, 130, 27);
+
+    // Score panel
+    DrawText("SCORE", 40, 265, 22, RAYWHITE);
+    DrawText(
+        TextFormat("%d", score),
+        40, 299, 26,
+        (Color) {
+        250, 215, 95, 255
+    }
+    );
+
+    DrawText("LINES", 40, 365, 22, RAYWHITE);
+    DrawText(
+        TextFormat("%d", lines),
+        40, 398, 25, RAYWHITE
+    );
+
+    DrawText("LEVEL", 40, 465, 22, RAYWHITE);
+    DrawText(
+        TextFormat("%d", level),
+        40, 498, 25, RAYWHITE
+    );
+
+    // Next queue
+    DrawText("NEXT", 550, 80, 23, RAYWHITE);
+
+    for (int i = 0; i < 5; i++) {
+        int py = 116 + i * 103;
+
+        DrawRectangle(
+            540, py, 160, 94,
+            (Color) {
+            29, 36, 54, 255
+        }
+        );
+
+        drawMini(
+            queue[i],
+            540, py,
+            160, 94, 20
+        );
+    }
+
+    // Controls
+    DrawText(
+        "ARROWS : MOVE",
+        35, 690, 17, LIGHTGRAY
+    );
+
+    DrawText(
+        "Z/X : ROTATE    C : HOLD    SPACE : DROP",
+        225, 690, 16, LIGHTGRAY
+    );
+
+    DrawText(
+        "P : PAUSE     R : RESTART",
+        225, 714, 16, LIGHTGRAY
+    );
+
+    // Event message
+    if (eventTimer > 0) {
+        DrawText(
+            eventText,
+            OX + 12,
+            OY + BH * CELL - 40,
+            24,
+            (Color) {
+            255, 220, 105, 255
+        }
+        );
+    }
+
+    // Score popup
+    if (awardTimer > 0 && lastAward > 0) {
+        DrawText(
+            TextFormat("+%d", lastAward),
+            OX + 75,
+            OY + 180 - (int)((1.1f - awardTimer) * 32),
+            32,
+            Fade(GOLD, awardTimer / 1.1f)
+        );
+    }
+
+    if (paused || gameOver) {
+        DrawRectangle(
+            OX, OY,
+            BW * CELL,
+            BH * CELL,
+            Fade(BLACK, 0.72f)
+        );
+
+        const char* msg =
+            gameOver ? "GAME OVER" : "PAUSED";
+
+        DrawText(
+            msg,
+            OX + (BW * CELL - MeasureText(msg, 33)) / 2,
+            OY + 250,
+            33,
+            RAYWHITE
+        );
+
+        DrawText(
+            "PRESS R TO RESTART",
+            OX + 32,
+            OY + 300,
+            19,
+            LIGHTGRAY
+        );
+    }
+}
+
+// ==============================
+// Main
+// ==============================
+
+int main(void) {
+    InitWindow(
+        740, 760,
+        "Tetris - C / raylib"
+    );
+
+    SetTargetFPS(60);
+    SetRandomSeed((unsigned int)time(NULL));
+
+    resetGame();
+
+    while (!WindowShouldClose()) {
+        float dt = GetFrameTime();
+
+        if (dt > 0.05f)
+            dt = 0.05f;
+
+        if (!paused)
+            updateEffects(dt);
+
+        if (IsKeyPressed(KEY_R))
+            resetGame();
+
+        if (IsKeyPressed(KEY_P) && !gameOver)
+            paused = !paused;
+
+        if (!paused && !gameOver) {
+            if (eventTimer > 0)
+                eventTimer -= dt;
+
+            if (IsKeyPressed(KEY_C))
+                holdPiece();
+
+            if (IsKeyPressed(KEY_Z))
+                rotatePiece(-1);
+
+            if (IsKeyPressed(KEY_X) ||
+                IsKeyPressed(KEY_UP))
+                rotatePiece(1);
+
+            int direction =
+                (IsKeyDown(KEY_LEFT) ? -1 : 0) +
+                (IsKeyDown(KEY_RIGHT) ? 1 : 0);
+
+            if (IsKeyPressed(KEY_LEFT)) {
+                movePiece(-1, 0, 1);
+                moveTimer = 0;
+            }
+            else if (IsKeyPressed(KEY_RIGHT)) {
+                movePiece(1, 0, 1);
+                moveTimer = 0;
+            }
+            else if (direction) {
+                moveTimer += dt;
+
+                if (moveTimer > 0.17f) {
+                    while (moveTimer > 0.17f) {
+                        movePiece(direction, 0, 1);
+                        moveTimer -= 0.045f;
+                    }
+                }
+            }
+            else {
+                moveTimer = 0;
+            }
+
+            if (IsKeyPressed(KEY_SPACE)) {
+                hardDrop();
+            }
+            else {
+                float interval =
+                    0.8f - 0.055f * (level - 1);
+
+                if (interval < 0.07f)
+                    interval = 0.07f;
+
+                if (IsKeyDown(KEY_DOWN))
+                    interval = 0.035f;
+
+                fallTimer += dt;
+
+                while (fallTimer >= interval) {
+                    fallTimer -= interval;
+
+                    if (movePiece(0, 1, 0) &&
+                        IsKeyDown(KEY_DOWN)) {
+                        score++;
+                    }
+                    else if (grounded()) {
+                        break;
+                    }
+                }
+
+                if (grounded()) {
+                    lockTimer += dt;
+
+                    if (lockTimer >= LOCK_TIME)
+                        lockPiece();
+                }
+                else {
+                    lockTimer = 0;
+                }
+            }
+        }
+
+        BeginDrawing();
+        drawGame();
+        EndDrawing();
+    }
+
+    CloseWindow();
+    return 0;
+}
+
+```
+
+테트리스 게임
+- 내려가고 착지한 후, 일정 시간은 조정 가능
+- 하나의 블록만 c로 홀드 가능
+- 
+
+소감
